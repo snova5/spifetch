@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""
+spifetch — your distro's logo, spinning in 3D, next to your system info.
+
+  * On Fedorium it spins the real 3D Fedorium logo (hexagon + fedora hat).
+  * On any other distro it asks fastfetch for that distro's ASCII logo,
+    extrudes it into 3D and spins it, keeping the logo's colours.
+  * Without fastfetch it spins the distro's name in 3D block letters.
+  * Works on Linux and Windows (Windows Terminal, PowerShell, CMD).
+
+Usage:
+  spifetch                 detect the distro and spin
+  spifetch --logo arch     spin another distro's logo (any fastfetch logo name)
+  spifetch --list          list the logo names fastfetch knows
+  spifetch --no-info       logo only, no system info
+  spifetch --speed 2.5     spin faster (radians per second)
+Stop with Ctrl+C.
+"""
+import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+CHARS = ".,-~:;=!*#$@"
+FPS = 30
+
+# ============================================================== system info
+IS_WIN = os.name == "nt"
+
+
+def fmt_uptime(s):
+    d, s = divmod(int(s), 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    parts = ([f"{d} day{'s' * (d != 1)}"] if d else []) + ([f"{h} hour{'s' * (h != 1)}"] if h else []) + [f"{m} min"]
+    return ", ".join(parts)
+
+
+def fmt_mem(used, total):
+    gib = 1024 ** 3
+    return f"{used / gib:.2f} GiB / {total / gib:.2f} GiB ({100 * used // total}%)"
+
+
+def clean_cpu(name):
+    name = re.sub(r"\((R|TM|tm|r)\)|CPU|Processor|\d+-Core|@.*$", "", name)
+    return re.sub(r"\s+", " ", name).strip() + f" ({os.cpu_count()})"
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+# ---------------- Windows
+def win_reg(path, name):
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except (OSError, ImportError):
+        return None
+
+
+def win_os():
+    cv = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    try:
+        build = int(win_reg(cv, "CurrentBuildNumber") or platform.version().split(".")[-1])
+    except ValueError:
+        build = 0
+    major = "11" if build >= 22000 else platform.release()
+    edition = win_reg(cv, "EditionID") or ""
+    edition = {"Professional": "Pro", "Core": "Home"}.get(edition, edition)
+    ver = win_reg(cv, "DisplayVersion") or ""
+    return " ".join(x for x in (f"Windows {major}", edition, ver) if x)
+
+
+def win_uptime():
+    import ctypes
+    k = ctypes.windll.kernel32
+    k.GetTickCount64.restype = ctypes.c_ulonglong
+    return fmt_uptime(k.GetTickCount64() / 1000)
+
+
+def win_memory():
+    import ctypes
+
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = MS()
+    m.dwLength = ctypes.sizeof(MS)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+        return None
+    return fmt_mem(m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys)
+
+
+def win_shell():
+    """Walk up the parent processes and report the first known shell."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        k = ctypes.windll.kernel32
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)
+        procs, e = {}, PE()
+        e.dwSize = ctypes.sizeof(PE)
+        ok = k.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            procs[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile.lower())
+            ok = k.Process32NextW(snap, ctypes.byref(e))
+        k.CloseHandle(snap)
+        names = {"pwsh.exe": "PowerShell 7", "powershell.exe": "Windows PowerShell",
+                 "nu.exe": "Nushell", "bash.exe": "Git Bash"}
+        pid, cmd_seen = os.getpid(), False
+        for _ in range(12):           # the spifetch.cmd launcher is itself a cmd.exe, so look further up
+            if pid not in procs:
+                break
+            pid = procs[pid][0]
+            exe = procs.get(pid, (0, ""))[1]
+            if exe in names:
+                return names[exe]
+            cmd_seen = cmd_seen or exe == "cmd.exe"
+        return "Command Prompt" if cmd_seen else None
+    except Exception:
+        return None
+
+
+def win_cpu():
+    n = win_reg(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString")
+    return clean_cpu(n) if n else (platform.processor() or None)
+
+
+# ---------------- Linux / other
+def os_release():
+    info = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.rstrip("\n").split("=", 1)
+                        info[k] = v.strip().strip('"')
+            break
+        except OSError:
+            continue
+    if not info and sys.platform == "darwin":
+        info = {"ID": "macos", "NAME": "macOS", "PRETTY_NAME": "macOS " + platform.mac_ver()[0]}
+    if not info and IS_WIN:
+        info = {"ID": "windows", "NAME": "Windows", "PRETTY_NAME": win_os()}
+    return info
+
+
+def lin_uptime():
+    try:
+        return fmt_uptime(float(read("/proc/uptime").split()[0]))
+    except (IndexError, ValueError):
+        return None
+
+
+def lin_cpu():
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            return clean_cpu(line.split(":", 1)[1])
+    return platform.processor() or None
+
+
+def lin_memory():
+    mi = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        if v:
+            mi[k] = int(v.split()[0]) * 1024
+    if "MemTotal" not in mi:
+        return None
+    return fmt_mem(mi["MemTotal"] - mi.get("MemAvailable", mi.get("MemFree", 0)), mi["MemTotal"])
+
+
+def system_info(osr):
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+    host = platform.node().split(".")[0]
+    if IS_WIN:
+        if os.environ.get("WT_SESSION"):
+            term = "Windows Terminal"
+        else:
+            term = os.environ.get("TERM_PROGRAM") or "Console Host"
+        rows = [("OS", f"{osr.get('PRETTY_NAME', 'Windows')} {platform.machine()}"),
+                ("Kernel", f"WIN32_NT {platform.version()}"), ("Uptime", win_uptime()),
+                ("DE", "Fluent"), ("Shell", win_shell()), ("Terminal", term),
+                ("CPU", win_cpu()), ("Memory", win_memory())]
+    else:
+        de = os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION")
+        if de:
+            de = {"KDE": "KDE Plasma"}.get(de.split(":")[0], de.split(":")[0])
+        term = (os.environ.get("TERM_PROGRAM") or (os.environ.get("KONSOLE_VERSION") and "Konsole")
+                or os.environ.get("TERM"))
+        rows = [("OS", f"{osr.get('PRETTY_NAME', osr.get('NAME', 'Unknown'))} {platform.machine()}"),
+                ("Kernel", platform.release()), ("Uptime", lin_uptime()), ("DE", de),
+                ("Shell", os.path.basename(os.environ.get("SHELL", "")) or None), ("Terminal", term),
+                ("CPU", lin_cpu()), ("Memory", lin_memory())]
+    return f"{user}@{host}", [(k, v) for k, v in rows if v]
+
+
+# ============================================================== logo sources
+def fedorium_points():
+    """The real Fedorium logo as a 3D point cloud (same shape as sfedorium)."""
+    HEX = [(200, 34), (344, 117), (344, 283), (200, 366), (56, 283), (56, 117)]
+
+    def quad(p0, p1, p2, n=10):
+        return [((1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t * t * p2[0],
+                 (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t * t * p2[1])
+                for t in (i / n for i in range(n + 1))]
+
+    dy = 10
+    crown = ([(140, 226), (152, 142)] + quad((152, 142), (155, 128), (169, 131))
+             + [(190, 139), (200, 151), (210, 139), (231, 131)]
+             + quad((231, 131), (245, 128), (248, 142)) + [(260, 226)])
+    crown = [(x, y + dy) for x, y in crown]
+    band = [(144.5, 192 + dy), (255.5, 192 + dy), (259.3, 220 + dy), (140.7, 220 + dy)]
+    brackets = [[(184, 197 + dy), (170, 206 + dy), (184, 215 + dy)],
+                [(216, 197 + dy), (230, 206 + dy), (216, 215 + dy)]]
+    brim = (88, 234 + dy, 312, 258 + dy, 12)
+
+    def inside(x, y, poly):
+        hit, j = False, len(poly) - 1
+        for i in range(len(poly)):
+            (xi, yi), (xj, yj) = poly[i], poly[j]
+            if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                hit = not hit
+            j = i
+        return hit
+
+    def segd(px, py, a, b):
+        dx, dy_ = b[0] - a[0], b[1] - a[1]
+        t = max(0.0, min(1.0, ((px - a[0]) * dx + (py - a[1]) * dy_) / (dx * dx + dy_ * dy_)))
+        return math.hypot(px - a[0] - t * dx, py - a[1] - t * dy_)
+
+    def lined(x, y, pts, closed=False):
+        segs = list(zip(pts, pts[1:] + ([pts[0]] if closed else [])))
+        return min(segd(x, y, a, b) for a, b in segs)
+
+    def inrr(x, y, r):
+        x0, y0, x1, y1, rad = r
+        return math.hypot(x - min(max(x, x0 + rad), x1 - rad), y - min(max(y, y0 + rad), y1 - rad)) <= rad
+
+    LIGHT, BLUE, NAVY = (142, 201, 240), (60, 110, 180), (41, 65, 114)
+
+    def region(x, y):
+        if inside(x, y, band) and min(lined(x, y, b) for b in brackets) <= 3.6:
+            return NAVY, 15
+        if inside(x, y, band):
+            return LIGHT, 13
+        if inrr(x, y, brim):
+            return BLUE, 13
+        if inside(x, y, crown):
+            return BLUE, 10
+        if lined(x, y, HEX, closed=True) <= 8:
+            return LIGHT, 12
+        return None
+
+    step = 2.5
+    cells = {}
+    n = int(360 / step) + 1
+    for gy in range(n):
+        for gx in range(n):
+            r = region(20 + gx * step, 20 + gy * step)
+            if r:
+                cells[(gx, gy)] = r
+    return extrude(cells, step, step), LIGHT
+
+
+def parse_ansi_screen(text):
+    """Replay terminal output (colours + cursor moves) into a grid of (char, rgb)."""
+    base16 = [(0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16), (36, 114, 200), (188, 63, 188),
+              (17, 168, 205), (229, 229, 229), (102, 102, 102), (241, 76, 76), (35, 209, 139),
+              (245, 245, 67), (59, 142, 234), (214, 112, 214), (41, 184, 219), (255, 255, 255)]
+
+    def c256(n):
+        if n < 16:
+            return base16[n]
+        if n < 232:
+            n -= 16
+            return tuple(0 if v == 0 else 55 + v * 40 for v in (n // 36, (n // 6) % 6, n % 6))
+        v = 8 + (n - 232) * 10
+        return (v, v, v)
+
+    grid, row, col = {}, 0, 0
+    color, bold = (220, 220, 220), False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\x1b" and i + 1 < len(text) and text[i + 1] == "[":
+            m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", text[i:])
+            if not m:
+                i += 1
+                continue
+            args, cmd = m.group(1), m.group(2)
+            nums = [int(x) if x.isdigit() else 0 for x in args.replace("?", "").split(";")] if args else []
+            n0 = nums[0] if nums and nums[0] else 1
+            if cmd == "m":
+                nums = nums or [0]
+                k = 0
+                while k < len(nums):
+                    v = nums[k]
+                    if v == 0:
+                        color, bold = (220, 220, 220), False
+                    elif v == 1:
+                        bold = True
+                    elif 30 <= v <= 37:
+                        color = base16[v - 30 + (8 if bold else 0)]
+                    elif 90 <= v <= 97:
+                        color = base16[v - 90 + 8]
+                    elif v == 39:
+                        color = (220, 220, 220)
+                    elif v == 38 and k + 2 < len(nums) and nums[k + 1] == 5:
+                        color = c256(nums[k + 2]); k += 2
+                    elif v == 38 and k + 4 < len(nums) and nums[k + 1] == 2:
+                        color = tuple(nums[k + 2:k + 5]); k += 4
+                    k += 1
+            elif cmd == "A":
+                row = max(0, row - n0)
+            elif cmd == "B":
+                row += n0
+            elif cmd == "C":
+                col += n0
+            elif cmd == "D":
+                col = max(0, col - n0)
+            elif cmd == "G":
+                col = n0 - 1
+            i += len(m.group(0))
+            continue
+        if ch == "\n":
+            row, col = row + 1, 0
+        elif ch == "\r":
+            col = 0
+        elif ch == "\x1b":
+            pass
+        else:
+            if ch != " ":
+                grid[(col, row)] = (ch, color)
+            col += 1
+        i += 1
+    return grid
+
+
+def fastfetch_points(logo=None):
+    exe = shutil.which("fastfetch")
+    if not exe:
+        return None
+    cmd = [exe, "--structure", "break", "--pipe", "false"]
+    if logo:
+        cmd += ["--logo", logo]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    grid = parse_ansi_screen(out)
+    if len(grid) < 20:
+        return None
+    cells = {}
+    for (c, r), (ch, rgb) in grid.items():
+        if ch.isspace():
+            continue
+        if sum(rgb) < 60:      # nearly black text would vanish on a dark terminal
+            rgb = (120, 120, 120)
+        cells[(c, r)] = (rgb, 3.0)
+    colors = [rgb for rgb, _ in cells.values()]
+    accent = max(set(colors), key=lambda c: (colors.count(c) > len(colors) * 0.05) * sum(c))
+    # a terminal cell is ~2x taller than wide: x step 1, y step 2
+    return extrude(cells, 1.0, 2.0), accent
+
+
+FONT = {  # tiny 5x7 block font for the fallback
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+    "C": ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
+    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+    "G": ["01111", "10000", "10000", "10011", "10001", "10001", "01111"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+    "J": ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+    "Q": ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+    "W": ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
+    "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+    "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+    "0": ["01110", "10011", "10101", "10101", "10101", "11001", "01110"],
+    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+    "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
+    "3": ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+    "6": ["01110", "10000", "10000", "11110", "10001", "10001", "01110"],
+    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+    "9": ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+    "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+}
+
+
+def text_points(word, rgb=(120, 170, 230)):
+    word = "".join(ch for ch in word.upper() if ch in FONT)[:8] or "LINUX"
+    cells = {}
+    for i, ch in enumerate(word):
+        for y, line in enumerate(FONT[ch]):
+            for x, bit in enumerate(line):
+                if bit == "1":
+                    cells[(i * 6 + x, y)] = (rgb, 1.0)
+    return extrude(cells, 1.0, 1.0), rgb
+
+
+def extrude(cells, sx, sy):
+    """Turn a 2D grid of coloured cells into front/back faces + side walls with normals.
+    cells: {(gx, gy): ((r, g, b), half_depth)}  ->  list of (x, y, z, nx, ny, nz, palette_index), palette"""
+    palette, pindex = [], {}
+    xs = [gx for gx, _ in cells]
+    ys = [gy for _, gy in cells]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    sub = 2 if sx <= 1 else 1           # supersample coarse grids so no holes appear
+    pts = []
+    for (gx, gy), (rgb, d) in cells.items():
+        if rgb not in pindex:
+            pindex[rgb] = len(palette)
+            palette.append(rgb)
+        p = pindex[rgb]
+        for ix in range(sub):
+            for iy in range(sub):
+                x = (gx - cx + ix / sub) * sx
+                y = (gy - cy + iy / sub) * sy
+                pts.append((x, y, -d, 0.0, 0.0, -1.0, p))
+                pts.append((x, y, d, 0.0, 0.0, 1.0, p))
+        x0, y0 = (gx - cx) * sx, (gy - cy) * sy
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = cells.get((gx + dx, gy + dy))
+            nd = nb[1] if nb else 0.0
+            if nd >= d:
+                continue
+            zstep = min(sx, sy) / sub
+            z = nd
+            while z <= d + 1e-9:
+                for t in range(sub):
+                    off = (t / sub - 0.5)
+                    px = x0 + (dx * 0.5 * sx if dx else off * sx)
+                    py = y0 + (dy * 0.5 * sy if dy else off * sy)
+                    for sz in (-1, 1):
+                        pts.append((px, py, sz * z, float(dx), float(dy), 0.0, p))
+                z += zstep
+    return pts, palette
+
+
+# ============================================================== renderer
+def render(points, palette, accent, title, info, speed, show_info):
+    if IS_WIN:
+        os.system("")  # turn on ANSI colours in the Windows console
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    radius = max(math.sqrt(x * x + y * y + z * z) for x, y, z, *_ in points) or 1.0
+    light = (-0.45, -0.55, -0.70)
+    ln = math.sqrt(sum(c * c for c in light))
+    lx, ly, lz = (c / ln for c in light)
+    nchars = len(CHARS) - 1
+    ar, ag, ab = accent
+    key_col = f"\x1b[1;38;2;{ar};{ag};{ab}m"
+    info_lines = [f"{key_col}{title}\x1b[0m", "\x1b[38;2;120;120;120m" + "-" * len(title) + "\x1b[0m"]
+    info_lines += [f"{key_col}{k}\x1b[0m: {v}" for k, v in info]
+    info_lines += ["", "".join(f"\x1b[38;2;{r};{g};{b}m███" for r, g, b in palette[:8]) + "\x1b[0m"]
+    info_w = max([len(title)] + [len(k) + 2 + len(v) for k, v in info]) + 4 if show_info else 0
+
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    start = time.time()
+    try:
+        while True:
+            cols, rows = shutil.get_terminal_size((100, 40))
+            h = max(10, rows - 1)
+            w = max(20, cols - info_w) if show_info and cols - info_w >= 30 else cols
+            show = show_info and w < cols
+            k2 = radius * 3.0
+            scale = min(h * 0.92, w / 2 * 0.92) / (2 * radius)
+            k1 = scale * (k2 - radius)
+            cx, cy = w / 2, h / 2
+
+            t = time.time() - start
+            a, b = t * speed, 0.25 * math.sin(t * 0.7)
+            ca, sa, cb, sb = math.cos(a), math.sin(a), math.cos(b), math.sin(b)
+            zbuf = [0.0] * (w * h)
+            out = [" "] * (w * h)
+            col = [-1] * (w * h)
+            for x, y, z, nx, ny, nz, p in points:
+                x1 = x * ca + z * sa
+                z1 = -x * sa + z * ca
+                y2 = y * cb - z1 * sb
+                z2 = y * sb + z1 * cb
+                ooz = 1.0 / (z2 + k2)
+                sx = int(cx + k1 * x1 * ooz * 2)
+                sy = int(cy + k1 * y2 * ooz)
+                if not (0 <= sx < w and 0 <= sy < h):
+                    continue
+                i = sx + sy * w
+                if ooz <= zbuf[i]:
+                    continue
+                nx1 = nx * ca + nz * sa
+                nz1 = -nx * sa + nz * ca
+                ny2 = ny * cb - nz1 * sb
+                nz2 = ny * sb + nz1 * cb
+                if nz2 > 0.35:
+                    continue
+                lum = nx1 * lx + ny2 * ly + nz2 * lz
+                lum = 0.08 if lum < 0.08 else lum
+                zbuf[i] = ooz
+                out[i] = CHARS[int(lum * nchars)]
+                col[i] = p * 16 + int(lum * 15)
+
+            top = max(0, (h - len(info_lines)) // 2)
+            lines = []
+            for r in range(h):
+                parts, last = [], None
+                for c in range(w):
+                    i = c + r * w
+                    if out[i] == " ":
+                        parts.append(" ")
+                        continue
+                    if col[i] != last:
+                        last = col[i]
+                        rr, gg, bb = palette[last // 16]
+                        f = 0.35 + 0.65 * (last % 16) / 15
+                        parts.append(f"\x1b[38;2;{int(rr * f)};{int(gg * f)};{int(bb * f)}m")
+                    parts.append(out[i])
+                line = "".join(parts) + "\x1b[0m"
+                if show and top <= r < top + len(info_lines):
+                    line += "  " + info_lines[r - top] + "\x1b[K"
+                else:
+                    line += "\x1b[K"
+                lines.append(line)
+            sys.stdout.write("\x1b[H" + "\n".join(lines))
+            sys.stdout.flush()
+            spare = 1 / FPS - (time.time() - start - t)
+            if spare > 0:
+                time.sleep(spare)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    if "--list" in args:
+        if shutil.which("fastfetch"):
+            subprocess.run(["fastfetch", "--print-logos"])
+        else:
+            print("spifetch uses fastfetch's logos. Install fastfetch first (Fedora: sudo dnf install fastfetch, Windows: winget install fastfetch).")
+        return
+    speed = 1.6
+    if "--speed" in args:
+        try:
+            speed = float(args[args.index("--speed") + 1])
+        except (IndexError, ValueError):
+            pass
+    logo = args[args.index("--logo") + 1] if "--logo" in args and args.index("--logo") + 1 < len(args) else None
+    show_info = "--no-info" not in args
+
+    osr = os_release()
+    distro = (logo or osr.get("ID", "")).lower()
+    if distro == "fedorium":
+        (points, palette), accent = fedorium_points()
+    else:
+        res = fastfetch_points(logo)
+        if res is None:
+            res = text_points(logo or osr.get("NAME") or osr.get("ID") or platform.system())
+        (points, palette), accent = res
+    title, info = system_info(osr)
+    render(points, palette, accent, title, info, speed, show_info)
+
+
+if __name__ == "__main__":
+    main()
